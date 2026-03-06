@@ -27,7 +27,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import (
+    CONF_ENABLE_DIY_SCENES,
     CONF_ENABLE_SCENES,
+    DEFAULT_ENABLE_DIY_SCENES,
     DEFAULT_ENABLE_SCENES,
     SEGMENT_MODE_GROUPED,
     SEGMENT_MODE_INDIVIDUAL,
@@ -67,11 +69,14 @@ async def async_setup_entry(
 
     # Check if scenes are enabled in options
     enable_scenes = entry.options.get(CONF_ENABLE_SCENES, DEFAULT_ENABLE_SCENES)
+    enable_diy_scenes = entry.options.get(CONF_ENABLE_DIY_SCENES, DEFAULT_ENABLE_DIY_SCENES)
 
     for device in coordinator.devices.values():
         # Only create light entities for devices with power control (not fans)
         if device.supports_power and not device.is_fan:
-            entities.append(GoveeLightEntity(coordinator, device, enable_scenes))
+            entities.append(
+                GoveeLightEntity(coordinator, device, enable_scenes, enable_diy_scenes)
+            )
 
         # Create segment entities for RGBIC devices based on per-device mode
         if device.supports_segments and device.segment_count > 0:
@@ -132,6 +137,7 @@ class GoveeLightEntity(GoveeEntity, LightEntity, RestoreEntity):
         coordinator: GoveeCoordinator,
         device: GoveeDevice,
         enable_scenes: bool = True,
+        enable_diy_scenes: bool = True,
     ) -> None:
         """Initialize the light entity."""
         super().__init__(coordinator, device)
@@ -144,14 +150,16 @@ class GoveeLightEntity(GoveeEntity, LightEntity, RestoreEntity):
         # Get device brightness range
         self._brightness_min, self._brightness_max = device.brightness_range
 
-        # Effect support: only if device has scenes AND scenes are enabled
+        # Effect support: if device has scenes or DIY scenes and they're enabled
         self._enable_scenes = device.supports_scenes and enable_scenes
-        if self._enable_scenes:
+        self._enable_diy_scenes = device.supports_diy_scenes and enable_diy_scenes
+        if self._enable_scenes or self._enable_diy_scenes:
             self._attr_supported_features = LightEntityFeature.EFFECT
 
         # Scene-to-effect mappings (populated in async_added_to_hass)
         self._effect_to_scene: dict[str, tuple[int, str]] = {}
         self._scene_id_to_effect: dict[str, str] = {}
+        self._diy_effect_ids: set[str] = set()  # Effect names that are DIY scenes
         self._effect_names: list[str] = []
 
     def _determine_color_modes(self) -> set[ColorMode]:
@@ -247,16 +255,25 @@ class GoveeLightEntity(GoveeEntity, LightEntity, RestoreEntity):
 
     @property
     def effect(self) -> str | None:
-        """Return currently active effect (scene name)."""
+        """Return currently active effect (scene or DIY scene name)."""
         state = self.device_state
-        if not state or not state.active_scene:
+        if not state:
             return None
-        # Look up display name from scene ID mapping
-        effect_name = self._scene_id_to_effect.get(state.active_scene)
-        if effect_name:
-            return effect_name
-        # Fall back to stored scene name if ID not in mapping
-        return state.active_scene_name
+
+        # Check DIY scene first (DIY scenes are listed first in effects)
+        if state.active_diy_scene:
+            effect_name = self._scene_id_to_effect.get(state.active_diy_scene)
+            if effect_name:
+                return effect_name
+
+        # Check regular scene
+        if state.active_scene:
+            effect_name = self._scene_id_to_effect.get(state.active_scene)
+            if effect_name:
+                return effect_name
+            return state.active_scene_name
+
+        return None
 
     def _ha_to_device_brightness(self, ha_brightness: int) -> int:
         """Convert HA brightness (0-255) to device range, respecting min."""
@@ -284,10 +301,17 @@ class GoveeLightEntity(GoveeEntity, LightEntity, RestoreEntity):
             scene_info = self._effect_to_scene.get(effect_name)
             if scene_info:
                 scene_id, scene_name = scene_info
-                await self.coordinator.async_control_device(
-                    self._device_id,
-                    SceneCommand(scene_id=scene_id, scene_name=scene_name),
-                )
+                if effect_name in self._diy_effect_ids:
+                    await self.coordinator.async_send_diy_scene(
+                        self._device_id,
+                        scene_id=scene_id,
+                        scene_name=scene_name,
+                    )
+                else:
+                    await self.coordinator.async_control_device(
+                        self._device_id,
+                        SceneCommand(scene_id=scene_id, scene_name=scene_name),
+                    )
             else:
                 _LOGGER.warning(
                     "Unknown effect '%s' for %s", effect_name, self._device.name
@@ -341,21 +365,27 @@ class GoveeLightEntity(GoveeEntity, LightEntity, RestoreEntity):
             PowerCommand(power_on=False),
         )
 
-    def _build_effect_mapping(self, scenes: list[dict[str, Any]]) -> None:
-        """Build effect name mappings from scene data.
+    def _build_effect_mapping(
+        self,
+        scenes: list[dict[str, Any]],
+        diy_scenes: list[dict[str, Any]],
+    ) -> None:
+        """Build effect name mappings from scene and DIY scene data.
 
-        Handles duplicate scene names by appending a counter,
-        mirroring the logic in GoveeSceneSelectEntity.
+        DIY scenes are listed first (user-created, likely preferred),
+        followed by regular scenes.
         """
         self._effect_to_scene = {}
         self._scene_id_to_effect = {}
-        names: list[str] = []
+        self._diy_effect_ids = set()
+        diy_names: list[str] = []
+        scene_names: list[str] = []
 
-        for scene_data in scenes:
-            scene_id = scene_data.get("value", {}).get("id", 0)
-            scene_name = scene_data.get("name", f"Scene {scene_id}")
+        # DIY scenes first — value is a plain int
+        for scene_data in diy_scenes:
+            scene_id = scene_data.get("value", 0)
+            scene_name = scene_data.get("name", f"DIY {scene_id}")
 
-            # Handle duplicate names by appending counter
             unique_name = scene_name
             counter = 1
             while unique_name in self._effect_to_scene:
@@ -364,9 +394,26 @@ class GoveeLightEntity(GoveeEntity, LightEntity, RestoreEntity):
 
             self._effect_to_scene[unique_name] = (scene_id, scene_name)
             self._scene_id_to_effect[str(scene_id)] = unique_name
-            names.append(unique_name)
+            self._diy_effect_ids.add(unique_name)
+            diy_names.append(unique_name)
 
-        self._effect_names = names
+        # Regular scenes — value is {"id": ..., "paramId": ...}
+        for scene_data in scenes:
+            scene_id = scene_data.get("value", {}).get("id", 0)
+            scene_name = scene_data.get("name", f"Scene {scene_id}")
+
+            unique_name = scene_name
+            counter = 1
+            while unique_name in self._effect_to_scene:
+                unique_name = f"{scene_name} ({counter})"
+                counter += 1
+
+            self._effect_to_scene[unique_name] = (scene_id, scene_name)
+            self._scene_id_to_effect[str(scene_id)] = unique_name
+            scene_names.append(unique_name)
+
+        # DIY first, then regular scenes
+        self._effect_names = diy_names + scene_names
 
     async def async_added_to_hass(self) -> None:
         """Restore state for group devices and load scenes for effects."""
@@ -385,7 +432,14 @@ class GoveeLightEntity(GoveeEntity, LightEntity, RestoreEntity):
                 self.coordinator.restore_group_state(self._device_id, power, brightness)
 
         # Load scenes for effect support (skip group devices - no scene API support)
-        if self._enable_scenes and not self._device.is_group:
-            scenes = await self.coordinator.async_get_scenes(self._device_id)
-            if scenes:
-                self._build_effect_mapping(scenes)
+        if (self._enable_scenes or self._enable_diy_scenes) and not self._device.is_group:
+            scenes: list[dict[str, Any]] = []
+            diy_scenes: list[dict[str, Any]] = []
+
+            if self._enable_scenes:
+                scenes = await self.coordinator.async_get_scenes(self._device_id)
+            if self._enable_diy_scenes:
+                diy_scenes = await self.coordinator.async_get_diy_scenes(self._device_id)
+
+            if scenes or diy_scenes:
+                self._build_effect_mapping(scenes, diy_scenes)
